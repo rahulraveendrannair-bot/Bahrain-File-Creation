@@ -1,27 +1,23 @@
-import io
-import re
-from datetime import datetime
-from typing import List, Dict, Tuple
+"""
+BH Sanctions List Updater — Streamlit App
+==========================================
+Matches exact column format of BH-TL-INDIVIDUALS.xlsx
+"""
 
+import io
+import json
+from datetime import datetime
+
+import pandas as pd
 import streamlit as st
-import fitz  # PyMuPDF
-import pdfplumber
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 
-# OCR is optional. If not installed / tesseract missing, app still runs with native extraction.
-try:
-    import pytesseract
-    from PIL import Image
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
-
-
-# =========================
-# Streamlit page setup
-# =========================
-st.set_page_config(page_title="BH Sanctions List Updater", page_icon="🛡️", layout="centered")
+st.set_page_config(
+    page_title="BH Sanctions List Updater",
+    page_icon="🛡️",
+    layout="wide",
+)
 
 COLUMNS = [
     "NAME", "AKA", "FOREIGN_SCRIPT", "SEX", "DOB", "POB",
@@ -29,389 +25,305 @@ COLUMNS = [
     "TITLE", "CITIZENSHIP", "REMARK",
 ]
 
-# Junk/navigation artifacts that can appear in extracted text
-GARBAGE_PATTERNS = [
-    r"click here",
-    r"individuals\s+click",
-    r"entities\s+click",
-    r"back to",
-    r"home",
-    r"download",
-    r"http[s]?://",
-    r"www\.",
-    r"\btable of contents\b",
-]
+# ── Alias map: any key Claude returns → correct column ─────────────────────
+ALIASES = {
+    "name": "NAME", "full_name": "NAME", "full name": "NAME",
+    "english_name": "NAME", "english name": "NAME",
 
-# Strong “field-like” patterns (may exist in some PDFs, not yours)
-RE_NAME_LINE = re.compile(r"(?im)^\s*Name\s*:\s*(.+?)\s*$")
+    "aka": "AKA", "also_known_as": "AKA", "also known as": "AKA",
+    "aliases": "AKA", "alias": "AKA", "other_names": "AKA", "other names": "AKA",
 
-# Bahrain Gazette / UN style name parts show up as numbered tokens:
-# e.g. "1: SAMI 2: JASIM 3: MUHAMMAD JAATA 4: AL-JABURI"
-RE_NUMBERED_TOKEN = re.compile(r"(\d+)\s*:\s*([A-Z][A-Z \-']{1,80})")
+    "foreign_script": "FOREIGN_SCRIPT", "foreign script": "FOREIGN_SCRIPT",
+    "arabic_name": "FOREIGN_SCRIPT", "arabic name": "FOREIGN_SCRIPT",
+    "arabic": "FOREIGN_SCRIPT", "name_in_original_language": "FOREIGN_SCRIPT",
+    "name in original language": "FOREIGN_SCRIPT", "original_script": "FOREIGN_SCRIPT",
 
+    "sex": "SEX", "gender": "SEX",
 
-# =========================
-# Helpers
-# =========================
-def normalize_space(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    "dob": "DOB", "date_of_birth": "DOB", "date of birth": "DOB",
+    "birth_date": "DOB", "birthdate": "DOB", "born": "DOB",
 
+    "pob": "POB", "place_of_birth": "POB", "place of birth": "POB",
+    "birth_place": "POB", "birthplace": "POB",
 
-def looks_like_garbage(text: str) -> bool:
-    """
-    Heuristic: treat extracted text as garbage if it's tiny or mostly nav text.
-    """
-    if not text or len(text.strip()) < 80:
-        return True
-    low = text.lower()
-    hits = sum(1 for p in GARBAGE_PATTERNS if re.search(p, low))
-    # if we see junk markers and text is small-ish, treat as garbage
-    return hits >= 1 and len(text.strip()) < 1200
+    "nationality": "NATIONALITY", "nationalities": "NATIONALITY",
 
+    "other_info": "OTHER_INFO", "other info": "OTHER_INFO",
+    "other_information": "OTHER_INFO", "other information": "OTHER_INFO",
+    "additional_info": "OTHER_INFO", "additional_information": "OTHER_INFO",
+    "details": "OTHER_INFO", "information": "OTHER_INFO",
+    "notes": "OTHER_INFO", "additional_details": "OTHER_INFO",
+    "listing_information": "OTHER_INFO", "listing information": "OTHER_INFO",
 
-# =========================
-# PDF Text extraction
-# =========================
-def extract_text_pymupdf_native(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
-    for page in doc:
-        t = page.get_text("text")
-        if t:
-            parts.append(t)
-    return "\n".join(parts).strip()
+    "add": "ADD", "address": "ADD", "full_address": "ADD", "full address": "ADD",
+
+    "add_country": "ADD_COUNTRY", "address_country": "ADD_COUNTRY",
+    "address country": "ADD_COUNTRY", "country": "ADD_COUNTRY",
+    "country_of_address": "ADD_COUNTRY",
+
+    "title": "TITLE", "designation": "TITLE",
+
+    "citizenship": "CITIZENSHIP", "citizenships": "CITIZENSHIP",
+
+    "remark": "REMARK", "remarks": "REMARK", "note": "REMARK",
+    "comments": "REMARK", "comment": "REMARK",
+}
 
 
-def extract_text_pdfplumber_native(pdf_bytes: bytes) -> str:
-    parts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                parts.append(t)
-    return "\n".join(parts).strip()
+def normalize(raw: dict) -> dict:
+    """Map any dict from Claude onto exact COLUMNS keys."""
+    result = {col: "" for col in COLUMNS}
+    for k, v in raw.items():
+        key = k.strip().lower().replace("-", "_")
+        mapped = ALIASES.get(key) or ALIASES.get(k.strip().lower())
+        if mapped and v:
+            val = str(v).strip()
+            if result[mapped] and val:
+                result[mapped] = result[mapped] + "; " + val
+            elif val:
+                result[mapped] = val
+    return result
 
 
-def extract_text_ocr_tesseract(pdf_bytes: bytes, dpi: int = 250, lang: str = "eng") -> str:
-    """
-    OCR fallback for scanned/image-based PDFs.
-    Requires pytesseract + PIL and the Tesseract binary installed on the host.
-    """
-    if not OCR_AVAILABLE:
-        return ""
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-
-    out = []
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        page_text = pytesseract.image_to_string(img, lang=lang)
-        if page_text:
-            out.append(page_text)
-
-    return "\n".join(out).strip()
-
-
-def extract_pdf_text_smart(pdf_bytes: bytes, dpi: int = 250, lang: str = "eng") -> Tuple[str, str]:
-    """
-    Returns (text, method_used)
-      1) PyMuPDF native
-      2) pdfplumber native
-      3) OCR (if available) when text is missing / garbage
-    """
-    t1 = extract_text_pymupdf_native(pdf_bytes)
-    if t1 and not looks_like_garbage(t1):
-        return t1, "PyMuPDF (native)"
-
-    t2 = extract_text_pdfplumber_native(pdf_bytes)
-    if t2 and not looks_like_garbage(t2):
-        return t2, "pdfplumber (native)"
-
-    # OCR fallback
-    if OCR_AVAILABLE:
-        t3 = extract_text_ocr_tesseract(pdf_bytes, dpi=dpi, lang=lang)
-        if t3:
-            return t3, f"OCR (Tesseract) @ {dpi} DPI lang={lang}"
-
-    # Last resort: return best we have (even if garbage) so diagnostics can show something
-    if t1:
-        return t1, "PyMuPDF (native, weak)"
-    if t2:
-        return t2, "pdfplumber (native, weak)"
-    return "", "none"
-
-
-# =========================
-# Bahrain-specific parsing (fix)
-# =========================
-def extract_names_from_numbered_tokens(text: str) -> List[str]:
-    """
-    Extracts names from numbered tokens pattern:
-      1: SAMI 2: JASIM 3: MUHAMMAD JAATA 4: AL-JABURI
-    Handles tokens on the SAME line or across multiple lines.
-
-    Strategy:
-      - Scan text sequentially and detect sequences starting at 1:
-          1:, 2:, 3: ... until break
-      - Build a full name by joining token values in numeric order
-    """
-    tokens = RE_NUMBERED_TOKEN.findall(text)
-    if not tokens:
-        return []
-
-    # Convert to (num, value)
-    parsed = []
-    for num_s, val in tokens:
-        num = int(num_s)
-        val = normalize_space(val)
-        # Filter junk-ish token values
-        low = val.lower()
-        if any(re.search(p, low) for p in GARBAGE_PATTERNS):
-            continue
-        # Avoid collecting empty / super short fragments
-        if len(val) < 2:
-            continue
-        parsed.append((num, val))
-
-    names = []
-    i = 0
-    while i < len(parsed):
-        num, val = parsed[i]
-        # We only start a person when we see "1:"
-        if num != 1:
-            i += 1
-            continue
-
-        seq = {1: val}
-        j = i + 1
-        expected = 2
-        while j < len(parsed):
-            n2, v2 = parsed[j]
-            if n2 == expected:
-                seq[expected] = v2
-                expected += 1
-                j += 1
-            elif n2 == 1:
-                # a new sequence starts
+def parse_json(text: str) -> list[dict]:
+    """Parse JSON from Claude, stripping markdown fences if present."""
+    text = text.strip()
+    if "```" in text:
+        for part in text.split("```"):
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("[") or part.startswith("{"):
+                text = part
                 break
-            else:
-                # ignore out-of-order tokens until we find expected or a new 1:
-                j += 1
-
-        # Build name if we got at least 2 parts
-        if len(seq) >= 2:
-            full_name = " ".join(seq[k] for k in sorted(seq.keys()))
-            full_name = normalize_space(full_name)
-            # filter “Individuals click here” style lines if they somehow got through
-            if not any(re.search(p, full_name.lower()) for p in GARBAGE_PATTERNS):
-                names.append(full_name)
-
-        i = j if j > i else i + 1
-
-    # de-dup
-    out = []
-    seen = set()
-    for n in names:
-        k = n.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(n)
-    return out
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise ValueError("JSON must be an array")
+    return [normalize(row) for row in data if isinstance(row, dict)]
 
 
-def parse_individuals(text: str) -> List[Dict[str, str]]:
-    """
-    Build individuals list for XLSX from extracted PDF text.
+# ── CSS ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.block-container { padding-top: 1.5rem; }
+.badge {
+    background:#e8f4ff; color:#0066cc; border:1px solid #b3d4f5;
+    border-radius:4px; padding:2px 8px; font-size:11px; font-weight:700;
+    margin-left:8px; vertical-align:middle;
+}
+.metric-row { display:flex; gap:14px; margin:12px 0 16px; }
+.mbox {
+    background:#f0faf5; border:1px solid #b3e6cf;
+    border-radius:8px; padding:14px 20px; text-align:center; flex:1;
+}
+.mnum { font-size:30px; font-weight:800; color:#00875a; }
+.mlbl { font-size:11px; color:#666; margin-top:2px; }
+.mbox.skip { background:#fffaf0; border-color:#f5d07a; }
+.mbox.skip .mnum { color:#b07d00; }
+</style>
+""", unsafe_allow_html=True)
 
-    Priority:
-      1) Bahrain numbered tokens (your PDF uses this) [1](https://wisetechglobal.sharepoint.com/sites/Content-as-Code/Shared%20Documents/SystemComponents/Home/eDocs-and-DocManager/Howto/How-to-call-Glow-API-with-DocToken-for-Shipamax-endpoints.aspx?web=1)
-      2) If not found, fallback to Name: lines if present
-      3) If still not found, return []
-    """
-    individuals: List[Dict[str, str]] = []
-
-    # 1) Bahrain numbered token names
-    numbered_names = extract_names_from_numbered_tokens(text)
-    for nm in numbered_names:
-        individuals.append({
-            "NAME": nm,
-            "AKA": "",
-            "FOREIGN_SCRIPT": "",
-            "SEX": "",
-            "DOB": "",
-            "POB": "",
-            "NATIONALITY": "",
-            "OTHER_INFO": "Auto-extracted from Bahrain Gazette (offline parser)",
-            "ADD": "",
-            "ADD_COUNTRY": "",
-            "TITLE": "",
-            "CITIZENSHIP": "",
-            "REMARK": "",
-        })
-
-    if individuals:
-        return individuals
-
-    # 2) Fallback: Name: lines (some docs use this)
-    for m in RE_NAME_LINE.finditer(text):
-        nm = normalize_space(m.group(1))
-        if nm and not any(re.search(p, nm.lower()) for p in GARBAGE_PATTERNS):
-            individuals.append({
-                "NAME": nm,
-                "AKA": "",
-                "FOREIGN_SCRIPT": "",
-                "SEX": "",
-                "DOB": "",
-                "POB": "",
-                "NATIONALITY": "",
-                "OTHER_INFO": "Auto-extracted from PDF (Name: field)",
-                "ADD": "",
-                "ADD_COUNTRY": "",
-                "TITLE": "",
-                "CITIZENSHIP": "",
-                "REMARK": "",
-            })
-
-    # de-dup
-    seen = set()
-    out = []
-    for r in individuals:
-        k = (r.get("NAME") or "").strip().lower()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(r)
-    return out
-
-
-# =========================
-# XLSX update
-# =========================
-def update_xlsx_with_individuals(xlsx_file, individuals: List[Dict[str, str]]) -> Tuple[bytes, int, int]:
-    wb = load_workbook(xlsx_file)
-    ws = wb.active
-
-    # Detect headers from row 1
-    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-    headers = [h for h in headers if h] or COLUMNS
-
-    existing = set()
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        name = str(row[0]).strip().lower() if row and row[0] else ""
-        if name:
-            existing.add(name)
-
-    added = skipped = 0
-
-    for person in individuals:
-        name = (person.get("NAME") or "").strip()
-        key = name.lower()
-        if not key or key in existing:
-            skipped += 1
-            continue
-
-        next_row = ws.max_row + 1
-        row_values = [person.get(col, "") or "" for col in headers]
-
-        for ci, value in enumerate(row_values, start=1):
-            cell = ws.cell(row=next_row, column=ci, value=value if value else None)
-            cell.font = Font(name="Calibri", size=11)
-
-        existing.add(key)
-        added += 1
-
-    ws.freeze_panes = "A2"
-
-    # Preserve typical widths (safe even if columns differ)
-    col_widths = {
-        "A": 49.36, "B": 39.82, "C": 14.82,
-        "E": 14.18, "F": 11.82, "G": 8.54,
-        "H": 33.45, "K": 7.18, "L": 6.82, "M": 13.18,
-    }
-    for col_letter, width in col_widths.items():
-        try:
-            ws.column_dimensions[col_letter].width = width
-        except Exception:
-            pass
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read(), added, skipped
-
-
-# =========================
-# UI
-# =========================
-st.markdown("## 🛡️ BH Sanctions List Updater (OFFLINE)")
-st.caption("Upload Gazette PDF + BH‑TL‑INDIVIDUALS.xlsx → download updated XLSX (No API, no JSON).")
+# ── Header ─────────────────────────────────────────────────────────────────
+st.markdown(
+    '## 🛡️ BH Sanctions List Updater <span class="badge">OFFLINE</span>',
+    unsafe_allow_html=True,
+)
+st.caption("Upload Gazette PDF + BH-TL-INDIVIDUALS.xlsx + Claude-extracted JSON → Download updated XLSX")
 st.divider()
 
-with st.sidebar:
-    st.markdown("### Extraction settings")
-    dpi = st.slider("OCR DPI (only if OCR used)", min_value=150, max_value=400, value=250, step=25)
-    ocr_lang = st.text_input("Tesseract language(s)", value="eng", help="Examples: eng, ara, eng+ara")
-    show_debug = st.toggle("Show diagnostics", value=True)
+# ── Extraction prompt ──────────────────────────────────────────────────────
+with st.expander("📋 Prompt to use in Claude AI to get the JSON", expanded=False):
+    st.markdown("Copy this prompt, then upload the Gazette PDF to [claude.ai](https://claude.ai) and send it:")
+    st.code("""Extract all sanctioned individuals from this PDF as a JSON array.
 
-    if not OCR_AVAILABLE:
-        st.warning("OCR libraries not available in this environment. Native extraction only.")
+For each person return an object with EXACTLY these keys:
+- NAME: Full name in English (uppercase)
+- AKA: All aliases separated by semicolons (include all name variants)
+- FOREIGN_SCRIPT: Name in Arabic or other non-Latin script
+- SEX: Male / Female or leave empty
+- DOB: Date of birth (include all known dates separated by semicolons)
+- POB: Place of birth
+- NATIONALITY: Nationality
+- OTHER_INFO: All other details — role, activities, listing date, passport numbers, ID numbers, physical description, alias document details, UN resolution references
+- ADD: Full address
+- ADD_COUNTRY: Country of address
+- TITLE: Title or designation (Haji, Dr, Sheikh, etc.)
+- CITIZENSHIP: Citizenship (if different from nationality)
+- REMARK: Gazette issue number, date added to list, UN SC resolution, reference number
 
-c1, c2 = st.columns(2)
+Return ONLY the JSON array. No markdown, no backticks, no explanation text.""",
+    language="text")
+
+    st.markdown("**Expected output format:**")
+    st.code("""[
+  {
+    "NAME": "SAMI JASIM MUHAMMAD JAATA AL-JABURI",
+    "AKA": "Mustafa Adnan al-Aziz; Mustafa Adnan al-Azeez; Sami al-Ajuz; Hajji Hamid",
+    "FOREIGN_SCRIPT": "سامي جاسم محمد جعاطة الجبوري",
+    "SEX": "Male",
+    "DOB": "1 Jul. 1974",
+    "POB": "Iraq",
+    "NATIONALITY": "Iraqi",
+    "OTHER_INFO": "QDi.437. Operated within ISIL (Da'esh) in Iraq and Syria. Listed in QDe.115. Head of Empowered Committee in ISIL. Financial affairs for ISIL. Terrorist operations against security forces. Mother's name: Aisha. Physical description: tall, brown skin, brown hair, black eyes. Identity docs: a) Syrian Arab Republic national ID 9080002892 (Mustafa Adnan al-Aziz, DOB 1 Jan 1973, POB Al-Bu Kamal, Syria); b) Turkish residence permit 4118 issued 15 Jan 2019 (Mustafa Adnan al-Azeez)",
+    "ADD": "Iraq",
+    "ADD_COUNTRY": "Iraq",
+    "TITLE": "",
+    "CITIZENSHIP": "Iraqi",
+    "REMARK": "Gazette No. 3869, 29 March 2026. Added to list: 26 March 2026. UN SC Resolution 2734 (2024), Chapter VII UN Charter. Reference: DPPA/SCAD/SCSOB/2026/SCA/2026 (03)"
+  }
+]""", language="json")
+
+st.divider()
+
+# ── File uploaders ─────────────────────────────────────────────────────────
+c1, c2, c3 = st.columns(3)
 with c1:
-    pdf_file = st.file_uploader("📄 Upload Gazette PDF", type=["pdf"])
+    st.markdown("**📄 Gazette PDF**")
+    pdf_file = st.file_uploader("PDF", type=["pdf"], label_visibility="collapsed", key="pdf")
+    if pdf_file:
+        st.success(f"✓ {pdf_file.name}")
 with c2:
-    xlsx_file = st.file_uploader("📊 Upload BH‑TL‑INDIVIDUALS.xlsx", type=["xlsx", "xls"])
+    st.markdown("**📊 BH-TL-INDIVIDUALS.xlsx**")
+    xlsx_file = st.file_uploader("XLSX", type=["xlsx","xls"], label_visibility="collapsed", key="xlsx")
+    if xlsx_file:
+        st.success(f"✓ {xlsx_file.name}")
+with c3:
+    st.markdown("**{ } Individuals JSON**")
+    json_file = st.file_uploader("JSON", type=["json","txt"], label_visibility="collapsed", key="json")
+    if json_file:
+        st.success(f"✓ {json_file.name}")
 
-run = st.button("▶ Extract & Update XLSX", type="primary", disabled=not (pdf_file and xlsx_file))
+st.divider()
 
-if run and pdf_file and xlsx_file:
-    pdf_bytes = pdf_file.read()
+# ── JSON preview ───────────────────────────────────────────────────────────
+if json_file:
+    st.markdown("### 👁️ Preview — verify before updating")
+    try:
+        raw_text = json_file.read().decode("utf-8")
+        json_file.seek(0)
+        previews = parse_json(raw_text)
 
-    text, method = extract_pdf_text_smart(pdf_bytes, dpi=dpi, lang=ocr_lang)
+        if previews:
+            for i, p in enumerate(previews):
+                with st.expander(f"#{i+1} — {p.get('NAME','(no name)')}", expanded=True):
+                    col_a, col_b = st.columns(2)
+                    fields_left  = ["NAME","AKA","FOREIGN_SCRIPT","SEX","DOB","POB","NATIONALITY","TITLE","CITIZENSHIP"]
+                    fields_right = ["OTHER_INFO","ADD","ADD_COUNTRY","REMARK"]
+                    with col_a:
+                        for f in fields_left:
+                            v = p.get(f,"")
+                            st.markdown(f"**{f}**")
+                            st.text(v if v else "—")
+                    with col_b:
+                        for f in fields_right:
+                            v = p.get(f,"")
+                            st.markdown(f"**{f}**")
+                            st.text(v if v else "—")
 
-    if show_debug:
-        with st.expander("🧪 Diagnostics", expanded=True):
-            st.write(f"Extractor used: **{method}**")
-            st.write(f"Extracted text length: **{len(text)}** characters")
-            preview = (text[:2000] + (" …" if len(text) > 2000 else "")) if text else "[EMPTY]"
-            st.code(preview, language="text")
-
-            if method.startswith("OCR"):
-                st.info("OCR was used because native extraction was missing/garbage.")
-
-    if not text:
-        st.error(
-            "No extractable text found. If your PDF is scanned, OCR is needed and requires Tesseract installed."
-        )
-        st.stop()
-
-    individuals = parse_individuals(text)
-
-    st.info(f"Found **{len(individuals)}** candidate individual(s).")
-
-    with st.expander("👀 Preview extracted names", expanded=True):
-        if not individuals:
-            st.write("No names extracted.")
+            # Check for empty columns
+            df_check = pd.DataFrame(previews)
+            empty_cols = [c for c in COLUMNS if not df_check[c].str.strip().any()]
+            if empty_cols:
+                st.warning(f"⚠️ These columns are empty for all records: **{', '.join(empty_cols)}**\n\n"
+                           "If unexpected, re-extract from Claude using the prompt above.")
         else:
-            for i, r in enumerate(individuals[:100], start=1):
-                st.write(f"{i}. {r.get('NAME', '')}")
-            if len(individuals) > 100:
-                st.caption(f"Showing first 100 of {len(individuals)}")
+            st.warning("No individuals found in JSON.")
+    except Exception as e:
+        st.error(f"Could not parse JSON: {e}")
+    st.divider()
 
-    out_bytes, added, skipped = update_xlsx_with_individuals(xlsx_file, individuals)
+# ── Run ────────────────────────────────────────────────────────────────────
+all_ready = pdf_file and xlsx_file and json_file
+run = st.button("▶  Update XLSX", disabled=not all_ready, type="primary")
+if not all_ready:
+    st.caption("⬆ Upload all three files above to enable.")
 
-    st.success(f"Done — Added: **{added}**, Skipped (duplicates/empty): **{skipped}**")
+if run and all_ready:
+    logs = []
+    added = skipped = 0
+    output_bytes = None
+    error = None
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = xlsx_file.name.rsplit(".", 1)[0]
-    out_name = f"{base}-UPDATED-{ts}.xlsx"
+    with st.spinner("Processing..."):
 
-    st.download_button(
-        "⬇️ Download Updated XLSX",
-        data=out_bytes,
-        file_name=out_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+        # Parse JSON
+        try:
+            raw_text = json_file.read().decode("utf-8")
+            individuals = parse_json(raw_text)
+            logs.append(("ok", f"JSON parsed — {len(individuals)} individual(s) found"))
+        except Exception as e:
+            error = f"Invalid JSON: {e}"
+
+        # Load XLSX
+        if not error:
+            try:
+                wb = load_workbook(xlsx_file)
+                ws = wb.active
+                existing = {
+                    str(row[0]).strip().lower()
+                    for row in ws.iter_rows(min_row=2, values_only=True)
+                    if row and row[0]
+                }
+                logs.append(("ok", f"XLSX loaded — {ws.max_row - 1} existing records"))
+            except Exception as e:
+                error = f"Cannot read XLSX: {e}"
+
+        # Append
+        if not error:
+            for person in individuals:
+                name = person.get("NAME", "").strip()
+                key = name.lower()
+                if not key or key in existing:
+                    logs.append(("warn", f"Skipped duplicate: {name or '(empty)'}"))
+                    skipped += 1
+                    continue
+                row_num = ws.max_row + 1
+                for ci, col_name in enumerate(COLUMNS, start=1):
+                    val = person.get(col_name) or None
+                    cell = ws.cell(row=row_num, column=ci, value=val)
+                    cell.font = Font(name="Calibri", size=11)
+                existing.add(key)
+                logs.append(("ok", f"Added: {name}"))
+                added += 1
+
+            # Preserve column widths
+            for col_letter, width in {
+                "A":49.36,"B":39.82,"C":14.82,
+                "E":14.18,"F":11.82,"G":8.54,
+                "H":33.45,"K":7.18,"L":6.82,"M":13.18,
+            }.items():
+                ws.column_dimensions[col_letter].width = width
+            ws.freeze_panes = "A2"
+
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            output_bytes = buf.read()
+            logs.append(("ok", f"Done — {added} added, {skipped} skipped"))
+
+    # Log output
+    with st.expander("📋 Processing log", expanded=True):
+        for level, msg in logs:
+            st.markdown(f"{'✅' if level == 'ok' else '⚠️'} {msg}")
+
+    if error:
+        st.error(f"**Error:** {error}")
+    elif output_bytes:
+        st.success("**Updated successfully!**")
+        st.markdown(f"""
+        <div class="metric-row">
+            <div class="mbox"><div class="mnum">{added}</div><div class="mlbl">Individual(s) Added</div></div>
+            <div class="mbox skip"><div class="mnum">{skipped}</div><div class="mlbl">Duplicate(s) Skipped</div></div>
+        </div>""", unsafe_allow_html=True)
+
+        base = xlsx_file.name.rsplit(".", 1)[0]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            label="⬇️  Download Updated XLSX",
+            data=output_bytes,
+            file_name=f"{base}-UPDATED-{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
