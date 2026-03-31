@@ -2,17 +2,13 @@ import io
 import re
 from datetime import datetime
 
-import pdfplumber
 import streamlit as st
+import pdfplumber
+import fitz  # PyMuPDF
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 
-# ── Config ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="BH Sanctions List Updater",
-    page_icon="🛡️",
-    layout="centered",
-)
+st.set_page_config(page_title="BH Sanctions List Updater", page_icon="🛡️", layout="centered")
 
 COLUMNS = [
     "NAME", "AKA", "FOREIGN_SCRIPT", "SEX", "DOB", "POB",
@@ -20,56 +16,108 @@ COLUMNS = [
     "TITLE", "CITIZENSHIP", "REMARK",
 ]
 
-# ── Header ────────────────────────────────────────────────────────────────
-st.markdown("## 🛡️ BH Sanctions List Updater (OFFLINE)")
-st.caption(
-    "Upload Bahrain Official Gazette PDF + BH‑TL‑INDIVIDUALS.xlsx → "
-    "download updated XLSX. No API. No JSON."
-)
-st.divider()
+# ---------------- PDF TEXT EXTRACTION ----------------
 
-# ── Uploaders ─────────────────────────────────────────────────────────────
-col1, col2 = st.columns(2)
+def extract_text_pymupdf(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    parts = []
+    for page in doc:
+        t = page.get_text("text")  # robust text extraction
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
 
-with col1:
-    st.markdown("**📄 Official Gazette PDF**")
-    pdf_file = st.file_uploader("Upload PDF", type=["pdf"], label_visibility="collapsed")
-
-with col2:
-    st.markdown("**📊 BH‑TL‑INDIVIDUALS.xlsx**")
-    xlsx_file = st.file_uploader("Upload XLSX", type=["xlsx"], label_visibility="collapsed")
-
-st.divider()
-
-# ── Extract text from PDF ─────────────────────────────────────────────────
-def extract_pdf_text(pdf_bytes) -> str:
-    text = []
-    with pdfplumber.open(pdf_bytes) as pdf:
+def extract_text_pdfplumber(pdf_bytes: bytes) -> str:
+    parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text.append(page_text)
-    return "\n".join(text)
+            t = page.extract_text()
+            if t:
+                parts.append(t)
+    return "\n".join(parts).strip()
 
-# ── Rule-based extraction (adjust regex if needed) ────────────────────────
-def extract_individuals_from_text(text: str):
+def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, str]:
+    """
+    Returns (text, method_used)
+    """
+    text = extract_text_pymupdf(pdf_bytes)
+    if text:
+        return text, "PyMuPDF"
+    text = extract_text_pdfplumber(pdf_bytes)
+    if text:
+        return text, "pdfplumber"
+    return "", "none"
+
+# ---------------- NAME PARSING ----------------
+
+NAME_LINE = re.compile(r"(?im)^\s*Name\s*:\s*(.+?)\s*$")
+NAME_ORIG = re.compile(r"(?im)^\s*Name\s*\(original.*?\)\s*:\s*(.+?)\s*$")
+AKA_LINE  = re.compile(r"(?im)^\s*(A\.k\.a|AKA|Aliases?)\s*:\s*(.+?)\s*$")
+DOB_LINE  = re.compile(r"(?im)^\s*(DOB|Date of birth)\s*:\s*(.+?)\s*$")
+NAT_LINE  = re.compile(r"(?im)^\s*(Nationality)\s*:\s*(.+?)\s*$")
+
+def normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def extract_individuals_from_text(text: str) -> list[dict]:
+    """
+    Extracts entries using:
+      1) Name: ...
+      2) Name (original script): ...
+    Then groups nearby fields (AKA/DOB/Nationality) in a small window.
+    """
+    lines = text.splitlines()
     individuals = []
 
-    # Example pattern: English name lines (ALL CAPS typical in gazettes)
-    name_pattern = re.compile(r"^[A-Z][A-Z\\s'.-]{6,}$", re.MULTILINE)
+    # Gather indices where "Name:" appears
+    name_hits = []
+    for i, line in enumerate(lines):
+        m = NAME_LINE.match(line)
+        if m:
+            name_hits.append((i, normalize_space(m.group(1))))
 
-    matches = name_pattern.findall(text)
+    # If no "Name:" hits, fallback: detect likely English-name-ish lines
+    # (Not ALL CAPS only; allow Title Case / hyphens / apostrophes)
+    if not name_hits:
+        likely = re.compile(r"^[A-Za-z][A-Za-z'.-]+(?:\s+[A-Za-z][A-Za-z'.-]+){1,6}$")
+        for i, line in enumerate(lines):
+            s = normalize_space(line)
+            if likely.match(s) and len(s) >= 8:
+                name_hits.append((i, s))
 
-    for name in matches:
+    # Build records using local window search around each hit
+    for idx, nm in name_hits:
+        window = "\n".join(lines[idx: idx + 25])  # look ahead 25 lines
+        foreign = ""
+        aka = ""
+        dob = ""
+        nat = ""
+
+        mo = NAME_ORIG.search(window)
+        if mo:
+            foreign = normalize_space(mo.group(1))
+
+        ma = AKA_LINE.search(window)
+        if ma:
+            aka = normalize_space(ma.group(2))
+
+        md = DOB_LINE.search(window)
+        if md:
+            dob = normalize_space(md.group(2))
+
+        mn = NAT_LINE.search(window)
+        if mn:
+            nat = normalize_space(mn.group(2))
+
         individuals.append({
-            "NAME": name.strip(),
-            "AKA": "",
-            "FOREIGN_SCRIPT": "",
+            "NAME": nm,
+            "AKA": aka,
+            "FOREIGN_SCRIPT": foreign,
             "SEX": "",
-            "DOB": "",
+            "DOB": dob,
             "POB": "",
-            "NATIONALITY": "",
-            "OTHER_INFO": "Extracted from Bahrain Official Gazette (auto)",
+            "NATIONALITY": nat,
+            "OTHER_INFO": "Auto-extracted from Gazette PDF (offline parser)",
             "ADD": "",
             "ADD_COUNTRY": "",
             "TITLE": "",
@@ -77,93 +125,109 @@ def extract_individuals_from_text(text: str):
             "REMARK": "",
         })
 
-    return individuals
+    # De-duplicate by NAME (case-insensitive)
+    seen = set()
+    uniq = []
+    for r in individuals:
+        k = r["NAME"].strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            uniq.append(r)
 
-# ── Run button ────────────────────────────────────────────────────────────
-run = st.button(
-    "▶ Extract & Update XLSX",
-    disabled=not (pdf_file and xlsx_file),
-    type="primary",
-)
+    return uniq
 
-if not (pdf_file and xlsx_file):
-    st.caption("⬆ Upload both PDF and XLSX to continue")
+# ---------------- XLSX UPDATE ----------------
 
-# ── Processing ────────────────────────────────────────────────────────────
-if run:
-    logs = []
+def update_xlsx(xlsx_file, individuals: list[dict]) -> tuple[bytes, int, int]:
+    wb = load_workbook(xlsx_file)
+    ws = wb.active
+
+    existing = {
+        str(row[0]).strip().lower()
+        for row in ws.iter_rows(min_row=2, values_only=True)
+        if row and row[0]
+    }
+
     added = skipped = 0
-    output_bytes = None
-    error = None
 
-    with st.spinner("Processing Gazette PDF..."):
+    for person in individuals:
+        name = (person.get("NAME") or "").strip()
+        key = name.lower()
 
-        try:
-            text = extract_pdf_text(pdf_file)
-            individuals = extract_individuals_from_text(text)
-            logs.append(f"PDF parsed — {len(individuals)} candidate names found")
-        except Exception as e:
-            error = f"PDF parsing failed: {e}"
+        if not key or key in existing:
+            skipped += 1
+            continue
 
-        if not error:
-            try:
-                wb = load_workbook(xlsx_file)
-                ws = wb.active
-                existing = {
-                    str(row[0]).strip().lower()
-                    for row in ws.iter_rows(min_row=2, values_only=True)
-                    if row and row[0]
-                }
-            except Exception as e:
-                error = f"XLSX load failed: {e}"
+        row_num = ws.max_row + 1
+        for ci, col_name in enumerate(COLUMNS, start=1):
+            val = person.get(col_name) or None
+            cell = ws.cell(row=row_num, column=ci, value=val)
+            cell.font = Font(name="Calibri", size=11)
 
-        if not error:
-            for person in individuals:
-                name = person["NAME"]
-                key = name.lower()
+        existing.add(key)
+        added += 1
 
-                if key in existing:
-                    skipped += 1
-                    continue
+    ws.freeze_panes = "A2"
 
-                row_num = ws.max_row + 1
-                for ci, col in enumerate(COLUMNS, start=1):
-                    ws.cell(row=row_num, column=ci, value=person.get(col) or None).font = Font(size=11)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read(), added, skipped
 
-                existing.add(key)
-                added += 1
 
-            ws.freeze_panes = "A2"
+# ---------------- UI ----------------
 
-            buf = io.BytesIO()
-            wb.save(buf)
-            buf.seek(0)
-            output_bytes = buf.read()
+st.markdown("## 🛡️ BH Sanctions List Updater (OFFLINE)")
+st.caption("Upload Gazette PDF + BH‑TL‑INDIVIDUALS.xlsx → download updated XLSX. No API. No JSON.")
+st.divider()
 
-    # ── Results ───────────────────────────────────────────────────────────
-    if error:
-        st.error(error)
-    else:
-        st.success("✅ Update complete")
-        st.markdown(
-            f"""
-**Results**
-- ✅ Added: **{added}**
-- ⚠ Skipped (duplicates): **{skipped}**
-"""
-        )
+c1, c2 = st.columns(2)
+with c1:
+    pdf_file = st.file_uploader("📄 Upload Gazette PDF", type=["pdf"])
+with c2:
+    xlsx_file = st.file_uploader("📊 Upload BH‑TL‑INDIVIDUALS.xlsx", type=["xlsx", "xls"])
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_name = f"BH-TL-INDIVIDUALS-UPDATED-{ts}.xlsx"
+run = st.button("▶ Extract & Update XLSX", type="primary", disabled=not (pdf_file and xlsx_file))
 
-        st.download_button(
-            "⬇️ Download Updated XLSX",
-            data=output_bytes,
-            file_name=out_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+if run:
+    pdf_bytes = pdf_file.read()
+    text, method = extract_pdf_text(pdf_bytes)
 
-        with st.expander("📋 Extraction log"):
-            for l in logs:
-                st.markdown(f"• {l}")
+    # Diagnostics first
+    with st.expander("🧪 Diagnostics (important)", expanded=True):
+        st.write(f"Extractor used: **{method}**")
+        st.write(f"Extracted text length: **{len(text)}** characters")
+        st.code((text[:1500] + ("…" if len(text) > 1500 else "")) or "[EMPTY TEXT]", language="text")
+
+        if not text:
+            st.error(
+                "No extractable text was found. This usually means the PDF is a scanned image. "
+                "Offline text extraction won’t work unless you add OCR."
+            )
+
+    if not text:
+        st.stop()
+
+    individuals = extract_individuals_from_text(text)
+
+    st.info(f"Found **{len(individuals)}** unique candidate name(s).")
+
+    with st.expander("👀 Preview extracted names", expanded=False):
+        for i, r in enumerate(individuals[:50], 1):
+            st.write(f"{i}. {r['NAME']}")
+        if len(individuals) > 50:
+            st.caption(f"Showing first 50 of {len(individuals)}")
+
+    out_bytes, added, skipped = update_xlsx(xlsx_file, individuals)
+
+    st.success(f"Done — Added: **{added}**, Skipped (duplicates/empty): **{skipped}**")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_name = f"{xlsx_file.name.rsplit('.',1)[0]}-UPDATED-{ts}.xlsx"
+    st.download_button(
+        "⬇️ Download Updated XLSX",
+        data=out_bytes,
+        file_name=out_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
