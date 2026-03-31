@@ -1,19 +1,25 @@
 import io
 import re
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import streamlit as st
 import fitz  # PyMuPDF
 import pdfplumber
-import pytesseract
-from PIL import Image
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 
+# OCR is optional. If not installed / tesseract missing, app still runs with native extraction.
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
 
 # =========================
-# Configuration
+# Streamlit page setup
 # =========================
 st.set_page_config(page_title="BH Sanctions List Updater", page_icon="🛡️", layout="centered")
 
@@ -23,7 +29,7 @@ COLUMNS = [
     "TITLE", "CITIZENSHIP", "REMARK",
 ]
 
-# Common junk / navigation strings that sometimes appear as the only "text"
+# Junk/navigation artifacts that can appear in extracted text
 GARBAGE_PATTERNS = [
     r"click here",
     r"individuals\s+click",
@@ -36,15 +42,12 @@ GARBAGE_PATTERNS = [
     r"\btable of contents\b",
 ]
 
-# Regex patterns inspired by typical Gazette/UN-style blocks that contain fields like Name/A.k.a/etc.
-RE_NAME = re.compile(r"(?im)^\s*Name\s*:\s*(.+?)\s*$")
-RE_NAME_ORIG = re.compile(r"(?im)^\s*Name\s*\(original.*?\)\s*:\s*(.+?)\s*$")
-RE_AKA = re.compile(r"(?im)^\s*(A\.k\.a\.?|AKA|Aliases?)\s*:\s*(.+?)\s*$")
-RE_DOB = re.compile(r"(?im)^\s*(DOB|Date of birth)\s*:\s*(.+?)\s*$")
-RE_POB = re.compile(r"(?im)^\s*(POB|Place of birth)\s*:\s*(.+?)\s*$")
-RE_NAT = re.compile(r"(?im)^\s*(Nationality)\s*:\s*(.+?)\s*$")
-RE_ADDR = re.compile(r"(?im)^\s*(Address)\s*:\s*(.+?)\s*$")
-RE_REMARK = re.compile(r"(?im)^\s*(Other information|Other info|Remarks?)\s*:\s*(.+?)\s*$")
+# Strong “field-like” patterns (may exist in some PDFs, not yours)
+RE_NAME_LINE = re.compile(r"(?im)^\s*Name\s*:\s*(.+?)\s*$")
+
+# Bahrain Gazette / UN style name parts show up as numbered tokens:
+# e.g. "1: SAMI 2: JASIM 3: MUHAMMAD JAATA 4: AL-JABURI"
+RE_NUMBERED_TOKEN = re.compile(r"(\d+)\s*:\s*([A-Z][A-Z \-']{1,80})")
 
 
 # =========================
@@ -54,20 +57,20 @@ def normalize_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def has_garbage_signature(text: str) -> bool:
+def looks_like_garbage(text: str) -> bool:
     """
-    True if extracted text is empty / too small / looks like navigation junk.
+    Heuristic: treat extracted text as garbage if it's tiny or mostly nav text.
     """
     if not text or len(text.strip()) < 80:
         return True
     low = text.lower()
-    # If a lot of matches are found, treat as junk
     hits = sum(1 for p in GARBAGE_PATTERNS if re.search(p, low))
-    return hits >= 1 and len(text.strip()) < 800  # small + contains junk
+    # if we see junk markers and text is small-ish, treat as garbage
+    return hits >= 1 and len(text.strip()) < 1200
 
 
 # =========================
-# PDF Text Extraction
+# PDF Text extraction
 # =========================
 def extract_text_pymupdf_native(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -89,12 +92,14 @@ def extract_text_pdfplumber_native(pdf_bytes: bytes) -> str:
     return "\n".join(parts).strip()
 
 
-def extract_text_ocr_tesseract(pdf_bytes: bytes, dpi: int, lang: str) -> str:
+def extract_text_ocr_tesseract(pdf_bytes: bytes, dpi: int = 250, lang: str = "eng") -> str:
     """
-    OCR fallback for scanned/image-based PDFs:
-      - Render pages to images with PyMuPDF
-      - OCR each page with Tesseract via pytesseract
+    OCR fallback for scanned/image-based PDFs.
+    Requires pytesseract + PIL and the Tesseract binary installed on the host.
     """
+    if not OCR_AVAILABLE:
+        return ""
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
@@ -110,191 +115,216 @@ def extract_text_ocr_tesseract(pdf_bytes: bytes, dpi: int, lang: str) -> str:
     return "\n".join(out).strip()
 
 
-def extract_pdf_text_smart(pdf_bytes: bytes, dpi: int, lang: str) -> Tuple[str, str]:
+def extract_pdf_text_smart(pdf_bytes: bytes, dpi: int = 250, lang: str = "eng") -> Tuple[str, str]:
     """
-    Returns (text, method_used).
-    Strategy:
-      1) PyMuPDF native text
-      2) pdfplumber native text
-      3) If still empty/junk -> OCR (Tesseract)
+    Returns (text, method_used)
+      1) PyMuPDF native
+      2) pdfplumber native
+      3) OCR (if available) when text is missing / garbage
     """
-    text = extract_text_pymupdf_native(pdf_bytes)
-    if text and not has_garbage_signature(text):
-        return text, "PyMuPDF (native)"
+    t1 = extract_text_pymupdf_native(pdf_bytes)
+    if t1 and not looks_like_garbage(t1):
+        return t1, "PyMuPDF (native)"
 
-    text2 = extract_text_pdfplumber_native(pdf_bytes)
-    if text2 and not has_garbage_signature(text2):
-        return text2, "pdfplumber (native)"
+    t2 = extract_text_pdfplumber_native(pdf_bytes)
+    if t2 and not looks_like_garbage(t2):
+        return t2, "pdfplumber (native)"
 
     # OCR fallback
-    ocr_text = extract_text_ocr_tesseract(pdf_bytes, dpi=dpi, lang=lang)
-    if ocr_text:
-        return ocr_text, f"OCR (Tesseract) @ {dpi} DPI, lang={lang}"
+    if OCR_AVAILABLE:
+        t3 = extract_text_ocr_tesseract(pdf_bytes, dpi=dpi, lang=lang)
+        if t3:
+            return t3, f"OCR (Tesseract) @ {dpi} DPI lang={lang}"
 
-    # nothing workable
+    # Last resort: return best we have (even if garbage) so diagnostics can show something
+    if t1:
+        return t1, "PyMuPDF (native, weak)"
+    if t2:
+        return t2, "pdfplumber (native, weak)"
     return "", "none"
 
 
 # =========================
-# Parsing Individuals
+# Bahrain-specific parsing (fix)
 # =========================
-def parse_individual_blocks(text: str) -> List[Dict[str, str]]:
+def extract_names_from_numbered_tokens(text: str) -> List[str]:
     """
-    Parse individuals using Name: ... blocks first (best signal).
-    If no Name: matches, fall back to "likely name lines" but aggressively filter junk.
-    """
-    lines = text.splitlines()
-    # Collect "Name:" hit indices
-    name_hits: List[Tuple[int, str]] = []
-    for i, line in enumerate(lines):
-        m = RE_NAME.match(line)
-        if m:
-            candidate = normalize_space(m.group(1))
-            if candidate and not any(re.search(p, candidate.lower()) for p in GARBAGE_PATTERNS):
-                name_hits.append((i, candidate))
+    Extracts names from numbered tokens pattern:
+      1: SAMI 2: JASIM 3: MUHAMMAD JAATA 4: AL-JABURI
+    Handles tokens on the SAME line or across multiple lines.
 
+    Strategy:
+      - Scan text sequentially and detect sequences starting at 1:
+          1:, 2:, 3: ... until break
+      - Build a full name by joining token values in numeric order
+    """
+    tokens = RE_NUMBERED_TOKEN.findall(text)
+    if not tokens:
+        return []
+
+    # Convert to (num, value)
+    parsed = []
+    for num_s, val in tokens:
+        num = int(num_s)
+        val = normalize_space(val)
+        # Filter junk-ish token values
+        low = val.lower()
+        if any(re.search(p, low) for p in GARBAGE_PATTERNS):
+            continue
+        # Avoid collecting empty / super short fragments
+        if len(val) < 2:
+            continue
+        parsed.append((num, val))
+
+    names = []
+    i = 0
+    while i < len(parsed):
+        num, val = parsed[i]
+        # We only start a person when we see "1:"
+        if num != 1:
+            i += 1
+            continue
+
+        seq = {1: val}
+        j = i + 1
+        expected = 2
+        while j < len(parsed):
+            n2, v2 = parsed[j]
+            if n2 == expected:
+                seq[expected] = v2
+                expected += 1
+                j += 1
+            elif n2 == 1:
+                # a new sequence starts
+                break
+            else:
+                # ignore out-of-order tokens until we find expected or a new 1:
+                j += 1
+
+        # Build name if we got at least 2 parts
+        if len(seq) >= 2:
+            full_name = " ".join(seq[k] for k in sorted(seq.keys()))
+            full_name = normalize_space(full_name)
+            # filter “Individuals click here” style lines if they somehow got through
+            if not any(re.search(p, full_name.lower()) for p in GARBAGE_PATTERNS):
+                names.append(full_name)
+
+        i = j if j > i else i + 1
+
+    # de-dup
+    out = []
+    seen = set()
+    for n in names:
+        k = n.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out
+
+
+def parse_individuals(text: str) -> List[Dict[str, str]]:
+    """
+    Build individuals list for XLSX from extracted PDF text.
+
+    Priority:
+      1) Bahrain numbered tokens (your PDF uses this) [1](https://wisetechglobal.sharepoint.com/sites/Content-as-Code/Shared%20Documents/SystemComponents/Home/eDocs-and-DocManager/Howto/How-to-call-Glow-API-with-DocToken-for-Shipamax-endpoints.aspx?web=1)
+      2) If not found, fallback to Name: lines if present
+      3) If still not found, return []
+    """
     individuals: List[Dict[str, str]] = []
 
-    # If we have Name hits, treat each as start of a block
-    if name_hits:
-        for idx, nm in name_hits:
-            window = "\n".join(lines[idx: idx + 30])  # look ahead within a local window
+    # 1) Bahrain numbered token names
+    numbered_names = extract_names_from_numbered_tokens(text)
+    for nm in numbered_names:
+        individuals.append({
+            "NAME": nm,
+            "AKA": "",
+            "FOREIGN_SCRIPT": "",
+            "SEX": "",
+            "DOB": "",
+            "POB": "",
+            "NATIONALITY": "",
+            "OTHER_INFO": "Auto-extracted from Bahrain Gazette (offline parser)",
+            "ADD": "",
+            "ADD_COUNTRY": "",
+            "TITLE": "",
+            "CITIZENSHIP": "",
+            "REMARK": "",
+        })
 
-            foreign = ""
-            aka = ""
-            dob = ""
-            pob = ""
-            nat = ""
-            addr = ""
-            remark = ""
+    if individuals:
+        return individuals
 
-            mo = RE_NAME_ORIG.search(window)
-            if mo:
-                foreign = normalize_space(mo.group(1))
-
-            ma = RE_AKA.search(window)
-            if ma:
-                aka = normalize_space(ma.group(2))
-
-            md = RE_DOB.search(window)
-            if md:
-                dob = normalize_space(md.group(2))
-
-            mp = RE_POB.search(window)
-            if mp:
-                pob = normalize_space(mp.group(2))
-
-            mn = RE_NAT.search(window)
-            if mn:
-                nat = normalize_space(mn.group(2))
-
-            mad = RE_ADDR.search(window)
-            if mad:
-                addr = normalize_space(mad.group(2))
-
-            mr = RE_REMARK.search(window)
-            if mr:
-                remark = normalize_space(mr.group(2))
-
+    # 2) Fallback: Name: lines (some docs use this)
+    for m in RE_NAME_LINE.finditer(text):
+        nm = normalize_space(m.group(1))
+        if nm and not any(re.search(p, nm.lower()) for p in GARBAGE_PATTERNS):
             individuals.append({
                 "NAME": nm,
-                "AKA": aka,
-                "FOREIGN_SCRIPT": foreign,
+                "AKA": "",
+                "FOREIGN_SCRIPT": "",
                 "SEX": "",
-                "DOB": dob,
-                "POB": pob,
-                "NATIONALITY": nat,
-                "OTHER_INFO": remark,
-                "ADD": addr,
+                "DOB": "",
+                "POB": "",
+                "NATIONALITY": "",
+                "OTHER_INFO": "Auto-extracted from PDF (Name: field)",
+                "ADD": "",
                 "ADD_COUNTRY": "",
                 "TITLE": "",
                 "CITIZENSHIP": "",
                 "REMARK": "",
             })
 
-    else:
-        # Fallback: attempt to detect likely name lines (Title Case / CAPS etc.)
-        # BUT: filter out anything that looks like navigation / labels.
-        likely = re.compile(r"^[A-Za-z][A-Za-z'.-]+(?:\s+[A-Za-z][A-Za-z'.-]+){1,6}$")
-
-        for line in lines:
-            s = normalize_space(line)
-            if not s:
-                continue
-            low = s.lower()
-            if any(re.search(p, low) for p in GARBAGE_PATTERNS):
-                continue
-            # skip obvious field labels
-            if re.match(r"(?i)^(name|aka|aliases|dob|pob|nationality|address)\b", s):
-                continue
-            if likely.match(s) and len(s) >= 10:
-                individuals.append({
-                    "NAME": s,
-                    "AKA": "",
-                    "FOREIGN_SCRIPT": "",
-                    "SEX": "",
-                    "DOB": "",
-                    "POB": "",
-                    "NATIONALITY": "",
-                    "OTHER_INFO": "Auto-extracted (fallback heuristic)",
-                    "ADD": "",
-                    "ADD_COUNTRY": "",
-                    "TITLE": "",
-                    "CITIZENSHIP": "",
-                    "REMARK": "",
-                })
-
-    # De-duplicate by NAME
+    # de-dup
     seen = set()
-    uniq = []
+    out = []
     for r in individuals:
-        key = (r.get("NAME") or "").strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            uniq.append(r)
-
-    return uniq
+        k = (r.get("NAME") or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
 
 
 # =========================
-# XLSX Update
+# XLSX update
 # =========================
 def update_xlsx_with_individuals(xlsx_file, individuals: List[Dict[str, str]]) -> Tuple[bytes, int, int]:
     wb = load_workbook(xlsx_file)
     ws = wb.active
 
-    # Detect headers from row 1 (if empty, use default columns)
+    # Detect headers from row 1
     headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
     headers = [h for h in headers if h] or COLUMNS
 
-    existing_names = set()
+    existing = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
         name = str(row[0]).strip().lower() if row and row[0] else ""
         if name:
-            existing_names.add(name)
+            existing.add(name)
 
-    added = 0
-    skipped = 0
+    added = skipped = 0
 
-    for ind in individuals:
-        name_key = (ind.get("NAME") or "").strip().lower()
-        if not name_key or name_key in existing_names:
+    for person in individuals:
+        name = (person.get("NAME") or "").strip()
+        key = name.lower()
+        if not key or key in existing:
             skipped += 1
             continue
 
-        next_row_num = ws.max_row + 1
-        new_row = [ind.get(col, "") or "" for col in headers]
+        next_row = ws.max_row + 1
+        row_values = [person.get(col, "") or "" for col in headers]
 
-        for ci, value in enumerate(new_row, start=1):
-            cell = ws.cell(row=next_row_num, column=ci, value=value if value else None)
+        for ci, value in enumerate(row_values, start=1):
+            cell = ws.cell(row=next_row, column=ci, value=value if value else None)
             cell.font = Font(name="Calibri", size=11)
 
-        existing_names.add(name_key)
+        existing.add(key)
         added += 1
 
     ws.freeze_panes = "A2"
 
-    # Optional: preserve common widths (safe even if columns differ)
+    # Preserve typical widths (safe even if columns differ)
     col_widths = {
         "A": 49.36, "B": 39.82, "C": 14.82,
         "E": 14.18, "F": 11.82, "G": 8.54,
@@ -320,18 +350,18 @@ st.caption("Upload Gazette PDF + BH‑TL‑INDIVIDUALS.xlsx → download updated
 st.divider()
 
 with st.sidebar:
-    st.markdown("### OCR Settings (used only if needed)")
-    dpi = st.slider("OCR DPI", min_value=150, max_value=400, value=250, step=25)
+    st.markdown("### Extraction settings")
+    dpi = st.slider("OCR DPI (only if OCR used)", min_value=150, max_value=400, value=250, step=25)
     ocr_lang = st.text_input("Tesseract language(s)", value="eng", help="Examples: eng, ara, eng+ara")
-
-    st.markdown("---")
-    st.markdown("### Debug")
     show_debug = st.toggle("Show diagnostics", value=True)
 
-col1, col2 = st.columns(2)
-with col1:
+    if not OCR_AVAILABLE:
+        st.warning("OCR libraries not available in this environment. Native extraction only.")
+
+c1, c2 = st.columns(2)
+with c1:
     pdf_file = st.file_uploader("📄 Upload Gazette PDF", type=["pdf"])
-with col2:
+with c2:
     xlsx_file = st.file_uploader("📊 Upload BH‑TL‑INDIVIDUALS.xlsx", type=["xlsx", "xls"])
 
 run = st.button("▶ Extract & Update XLSX", type="primary", disabled=not (pdf_file and xlsx_file))
@@ -349,30 +379,26 @@ if run and pdf_file and xlsx_file:
             st.code(preview, language="text")
 
             if method.startswith("OCR"):
-                st.info(
-                    "OCR was used because native text extraction looked empty/junk. "
-                    "OCR requires Tesseract installed on the host."
-                )
+                st.info("OCR was used because native extraction was missing/garbage.")
 
     if not text:
         st.error(
-            "No extractable text was found even after OCR. "
-            "If you are running this on a server, ensure Tesseract OCR is installed and accessible."
+            "No extractable text found. If your PDF is scanned, OCR is needed and requires Tesseract installed."
         )
         st.stop()
 
-    individuals = parse_individual_blocks(text)
+    individuals = parse_individuals(text)
 
-    st.info(f"Found **{len(individuals)}** unique candidate individual(s).")
+    st.info(f"Found **{len(individuals)}** candidate individual(s).")
 
-    with st.expander("👀 Preview extracted names", expanded=False):
+    with st.expander("👀 Preview extracted names", expanded=True):
         if not individuals:
             st.write("No names extracted.")
         else:
-            for i, r in enumerate(individuals[:50], start=1):
-                st.write(f"{i}. {r.get('NAME','')}")
-            if len(individuals) > 50:
-                st.caption(f"Showing first 50 of {len(individuals)}")
+            for i, r in enumerate(individuals[:100], start=1):
+                st.write(f"{i}. {r.get('NAME', '')}")
+            if len(individuals) > 100:
+                st.caption(f"Showing first 100 of {len(individuals)}")
 
     out_bytes, added, skipped = update_xlsx_with_individuals(xlsx_file, individuals)
 
